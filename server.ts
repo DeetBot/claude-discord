@@ -70,9 +70,9 @@ const INBOX_DIR = join(STATE_DIR, 'inbox')
 
 const MODEL_MAP: Record<string, string> = {
   sonnet: 'claude-sonnet-5',
-  opus:   'claude-opus-4-8',
+  opus:   'claude-opus-5',
   haiku:  'claude-haiku-4-5-20251001',
-  fable: 'claude-fable-5',
+  fable:  'claude-fable-5',
 }
 
 function readPersonaName(): string {
@@ -1083,12 +1083,13 @@ client.once('ready', async c => {
   const modelOption = {
     type: 3, // STRING
     name: 'model',
-    description: 'Model name: sonnet, opus, haiku',
+    description: 'Model name: sonnet, opus, haiku, fable',
     required: true,
     choices: [
-      { name: 'Sonnet (claude-sonnet-4-6)', value: 'sonnet' },
-      { name: 'Opus (claude-opus-4-7)', value: 'opus' },
+      { name: 'Sonnet (claude-sonnet-5)', value: 'sonnet' },
+      { name: 'Opus (claude-opus-5)', value: 'opus' },
       { name: 'Haiku (claude-haiku-4-5)', value: 'haiku' },
+      { name: 'Fable (claude-fable-5)', value: 'fable' },
     ],
   }
   const commands = [
