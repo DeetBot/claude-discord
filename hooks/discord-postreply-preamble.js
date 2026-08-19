@@ -38,6 +38,20 @@ function textOf(content) {
   return ''
 }
 
+// See discord-stop-forward.js for rationale. Strips Claude Code injection
+// wrappers if the model echoed them into its own text output. Empty result
+// means "nothing worth forwarding".
+function stripPromptScaffolding(text) {
+  if (!text) return ''
+  const cleaned = text
+    .replace(/<system-reminder\b[\s\S]*?<\/system-reminder>/g, '')
+    .replace(/<channel\s+source="[^"]*"[\s\S]*?<\/channel>/g, '')
+    .replace(/^\s*(Human|Assistant|User):\s*$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+  return cleaned
+}
+
 function isToolResult(content) {
   return Array.isArray(content) && content.length > 0 &&
     content.every(b => b && b.type === 'tool_result')
@@ -116,14 +130,17 @@ process.stdin.on('end', async () => {
     upperBound = replyIndex
   }
 
-  // Collect text entries that haven't been forwarded yet.
+  // Collect text entries that haven't been forwarded yet. Sanitize each to
+  // drop any echoed Claude Code prompt-scaffolding tags — a model that emits
+  // raw `<system-reminder>` / `<channel>` blocks should not spam the user's
+  // channel with those. If a text entry is ENTIRELY scaffolding, skip it.
   const toForward = []
   for (let i = turnStart + 1; i < upperBound; i++) {
     if (i <= state.forwarded_up_to) continue
     const e = entries[i]
     if (e.type !== 'assistant') continue
     const content = e.message && e.message.content
-    const t = textOf(content)
+    const t = stripPromptScaffolding(textOf(content))
     if (t) toForward.push({ index: i, text: t })
   }
   if (toForward.length === 0) process.exit(0)
@@ -138,8 +155,8 @@ process.stdin.on('end', async () => {
   try { writeFileSync(stateFile, JSON.stringify(state)) } catch {}
 
   const preambleText = toForward.map(x => x.text).join('\n\n').trim()
-  const italicPreamble = `_${preambleText}_`
-  const preamble = italicPreamble
+  const blockquotePreamble = preambleText.split('\n').map(line => `> ${line}`).join('\n')
+  const preamble = blockquotePreamble
 
   const isPrimaryChannel = personaChannel && channel === personaChannel
 
@@ -147,7 +164,7 @@ process.stdin.on('end', async () => {
     let body, path, method
 
     if (isReplyTool && isPrimaryChannel) {
-      const sendContent = italicPreamble.length > 2000 ? italicPreamble.slice(0, 1997) + '…' : italicPreamble
+      const sendContent = blockquotePreamble.length > 2000 ? blockquotePreamble.slice(0, 1997) + '…' : blockquotePreamble
       body = JSON.stringify({ content: sendContent })
       path = `/api/v10/channels/${channel}/messages`
       method = 'POST'
