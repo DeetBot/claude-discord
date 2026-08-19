@@ -42,6 +42,27 @@ function textOf(content) {
   return ''
 }
 
+// Strip prompt-scaffolding blocks the model may have hallucinated back into
+// its text output. `<system-reminder>...</system-reminder>` and `<channel
+// source="plugin:artifice-discord:..." ...>...</channel>` are Claude Code
+// injection wrappers — they belong to the transcript view, not to a
+// user-facing Discord reply. If the model echoes them (which it sometimes
+// does when producing forced-visible output on empty turns), we don't want
+// that leaking to the user's DM. Returns cleaned text; caller decides
+// whether the residue is worth forwarding.
+function stripPromptScaffolding(text) {
+  if (!text) return ''
+  const cleaned = text
+    .replace(/<system-reminder\b[\s\S]*?<\/system-reminder>/g, '')
+    .replace(/<channel\s+source="[^"]*"[\s\S]*?<\/channel>/g, '')
+    // Transcript role markers left dangling after tag-strip ("Human:",
+    // "Assistant:") are scaffolding too — drop them at line starts.
+    .replace(/^\s*(Human|Assistant|User):\s*$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+  return cleaned
+}
+
 function isToolResult(content) {
   return Array.isArray(content) && content.length > 0 &&
     content.every(b => b && b.type === 'tool_result')
@@ -106,6 +127,12 @@ process.stdin.on('end', async () => {
 
   if (!leakedText) process.exit(0)
   if (!triggerContent || !triggerContent.includes(DISCORD_SOURCE)) process.exit(0)
+
+  // Sanitize before forwarding: drop any echoed prompt-scaffolding tags
+  // (Claude Code's `<system-reminder>` and this plugin's `<channel>` wrapper).
+  // If nothing meaningful remains, don't forward the noise.
+  leakedText = stripPromptScaffolding(leakedText)
+  if (!leakedText) process.exit(0)
 
   let persona = {}
   try { persona = readFrontmatter(readFileSync(personaPath, 'utf8')) } catch {}
