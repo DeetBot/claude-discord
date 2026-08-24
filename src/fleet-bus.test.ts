@@ -5,6 +5,7 @@ import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   DEFAULT_MAX_ENVELOPE_BYTES,
+  createHeartbeatEnvelope,
   FleetBus,
   loadFleetManifestAllowlist,
   normalizeAllowlist,
@@ -83,6 +84,28 @@ describe('envelope validation', () => {
   test('rejects envelopes above the encoded byte limit', () => {
     const value = envelope({ payload: 'x'.repeat(DEFAULT_MAX_ENVELOPE_BYTES) })
     expect(validateEnvelope(value, allowlist)).toEqual({ ok: false, error: 'envelope_too_large' })
+  })
+})
+
+describe('status heartbeat', () => {
+  test('uses the v1 envelope and identifies its sender', () => {
+    const heartbeat = createHeartbeatEnvelope('ＫＡＴ', '0.4.0', 1234, new Date('2026-08-24T18:36:25.889Z'))
+
+    expect(heartbeat).toMatchObject({
+      envelope_version: 1,
+      from: 'kat',
+      to: null,
+      kind: 'status_heartbeat',
+      ts: '2026-08-24T18:36:25.889Z',
+      payload: {
+        online: true,
+        process_alive_ts: '2026-08-24T18:36:25.889Z',
+        pid: 1234,
+        plugin_version: '0.4.0',
+      },
+    })
+    expect(heartbeat.id).toMatch(/^[a-f0-9-]{36}$/)
+    expect(validateEnvelope(heartbeat, normalizeAllowlist(['kat'])).ok).toBe(true)
   })
 })
 

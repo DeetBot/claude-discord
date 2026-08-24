@@ -1,5 +1,5 @@
 import { connect as natsConnect, JSONCodec, type NatsConnection, type Msg, type Subscription } from 'nats'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { appendFileSync, chmodSync, mkdirSync, readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { parse as parseYaml } from 'yaml'
@@ -10,7 +10,7 @@ export interface Envelope<P = unknown> {
   envelope_version: 1
   id: string
   from: string
-  to?: string
+  to?: string | null
   kind: string
   in_reply_to?: string
   ts: string
@@ -105,6 +105,33 @@ export function loadFleetManifestAllowlist(path: string): Set<string> {
   return normalizeAllowlist(botNames)
 }
 
+export function createHeartbeatEnvelope(
+  botName: string,
+  pluginVersion: string,
+  pid = process.pid,
+  now = new Date(),
+): Envelope {
+  const from = normalizeBotName(botName)
+  if (from === null) throw new TypeError('Invalid heartbeat bot name')
+  const ts = now.toISOString()
+  return {
+    envelope_version: 1,
+    id: randomUUID(),
+    from,
+    to: null,
+    kind: 'status_heartbeat',
+    ts,
+    payload: {
+      online: true,
+      process_alive_ts: ts,
+      session_last_response_ts: null,
+      injection_delivered_ts: null,
+      pid,
+      plugin_version: pluginVersion,
+    },
+  }
+}
+
 /** Validate the v1 wire envelope before it reaches any bus handler. */
 export function validateEnvelope(
   value: unknown,
@@ -121,7 +148,9 @@ export function validateEnvelope(
   if (typeof candidate.kind !== 'string' || candidate.kind.length === 0) return { ok: false, error: 'invalid_kind' }
   if (typeof candidate.ts !== 'string' || Number.isNaN(Date.parse(candidate.ts))) return { ok: false, error: 'invalid_ts' }
   if (!Object.hasOwn(candidate, 'payload')) return { ok: false, error: 'missing_payload' }
-  if (candidate.to !== undefined && typeof candidate.to !== 'string') return { ok: false, error: 'invalid_to' }
+  if (candidate.to !== undefined && candidate.to !== null && typeof candidate.to !== 'string') {
+    return { ok: false, error: 'invalid_to' }
+  }
   if (candidate.in_reply_to !== undefined && typeof candidate.in_reply_to !== 'string') {
     return { ok: false, error: 'invalid_in_reply_to' }
   }
@@ -269,14 +298,13 @@ export class FleetBus {
 
   private publishHeartbeat(): void {
     if (!this.nc || this.nc.isClosed()) return
-    this.nc.publish(`fleet.${this.config.botName}.status`, this.codec.encode({
-      online: true,
-      process_alive_ts: new Date().toISOString(),
-      session_last_response_ts: null,
-      injection_delivered_ts: null,
-      pid: process.pid,
-      plugin_version: this.config.pluginVersion ?? '0.3.0',
-    }))
+    this.nc.publish(
+      `fleet.${this.config.botName}.status`,
+      this.codec.encode(createHeartbeatEnvelope(
+        this.config.botName,
+        this.config.pluginVersion ?? '0.4.0',
+      )),
+    )
   }
 
   private async watchConnectionStatus(nc: NatsConnection): Promise<void> {
