@@ -149,6 +149,25 @@ describe('request session injection', () => {
     expect(injected).toBe(false)
     expect(readFileSync(auditLogPath, 'utf8')).toContain('from_claim_rejected')
   })
+
+  test.each([
+    ['another bot', 'kat'],
+    ['null', null],
+    ['a missing recipient', undefined],
+  ])('rejects direct requests addressed to %s', async (_label, to) => {
+    const dir = mkdtempSync(join(tmpdir(), 'fleet-audit-'))
+    const auditLogPath = join(dir, 'fleet-bus.jsonl')
+    let injected = false
+    const bus = new TestFleetBus({
+      botName: 'vec', url: 'nats://unused', user: 'vec', password: 'unused', auditLogPath,
+      injectIntoSession: async () => { injected = true },
+    }, allowlist)
+
+    await bus.handleRequest(envelope({ to }))
+
+    expect(injected).toBe(false)
+    expect(readFileSync(auditLogPath, 'utf8')).toContain('recipient_mismatch')
+  })
 })
 
 const integrationTest = process.env.FLEET_BUS_INTEGRATION === '1' ? test : test.skip

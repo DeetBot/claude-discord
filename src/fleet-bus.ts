@@ -261,6 +261,15 @@ export class FleetBus {
       this.recordAudit({ dir: 'drop', subject: message.subject, reason: result.error })
       return
     }
+    if (normalizeBotName(result.envelope.to) !== normalizeBotName(this.config.botName)) {
+      this.recordAudit({
+        dir: 'drop',
+        subject: message.subject,
+        reason: 'recipient_mismatch',
+        envelope_id: result.envelope.id,
+      })
+      return
+    }
 
     const reqId = randomBytes(16).toString('hex')
     await this.injectIntoSession(result.envelope, reqId).catch(error => {
