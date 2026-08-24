@@ -131,6 +131,8 @@ the existing Discord path running unchanged.
 | `FLEET_BUS_USER` | persona `name` | Per-bot NATS username and subject identity |
 | `FLEET_BUS_TOKEN_FILE` | `~/.claude/fleet-bus-token-<bot>` | File containing the per-bot NATS password |
 | `FLEET_BUS_SUBSCRIBE_BROADCAST` | `0` | Subscribe to `fleet.broadcast.>` when set to `1` |
+| `FLEET_BUS_MANIFEST_PATH` | `~/vault/infra/fleet-manifest.yaml` | YAML source for the accepted `from_claim` bot allowlist |
+| `FLEET_BUS_AUDIT_LOG_PATH` | `~/.claude/fleet-bus-log.jsonl` | Owner-only inbound/drop audit log |
 
 The module subscribes to the bot's request, result, and status subjects and
 publishes a process heartbeat every 30 seconds. Stage 1 logs received bus

@@ -1,4 +1,8 @@
 import { connect as natsConnect, JSONCodec, type NatsConnection, type Msg, type Subscription } from 'nats'
+import { randomBytes } from 'node:crypto'
+import { appendFileSync, chmodSync, mkdirSync, readFileSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { parse as parseYaml } from 'yaml'
 
 export const DEFAULT_MAX_ENVELOPE_BYTES = 1_044_480
 
@@ -23,6 +27,13 @@ export interface FleetBusConfig {
   heartbeatIntervalMs?: number
   pluginVersion?: string
   logger?: (message: string) => void
+  auditLogPath?: string
+  injectIntoSession?: (event: FleetBusSessionEvent) => Promise<void>
+}
+
+export interface FleetBusSessionEvent {
+  envelope: Envelope
+  reqId: string
 }
 
 export interface TokenBucket {
@@ -80,6 +91,18 @@ export function normalizeAllowlist(values: Iterable<unknown>): Set<string> {
     result.add(normalized)
   }
   return result
+}
+
+export function loadFleetManifestAllowlist(path: string): Set<string> {
+  const manifest = parseYaml(readFileSync(path, 'utf8')) as unknown
+  if (typeof manifest !== 'object' || manifest === null || Array.isArray(manifest)) {
+    throw new TypeError('Fleet manifest must be a YAML mapping')
+  }
+  const botNames = (manifest as Record<string, unknown>).bot_names
+  if (!Array.isArray(botNames) || botNames.length === 0) {
+    throw new TypeError('Fleet manifest bot_names must be a non-empty list')
+  }
+  return normalizeAllowlist(botNames)
 }
 
 /** Validate the v1 wire envelope before it reaches any bus handler. */
@@ -192,9 +215,28 @@ export class FleetBus {
     throw new Error('FleetBus.publishReply is not implemented')
   }
 
-  protected onRequest(message: Msg): void {
-    this.log(`received ${message.subject}`)
-    // TODO(stage-2): validate, gate, ledger, audit, then inject into the session.
+  protected async onRequest(message: Msg): Promise<void> {
+    let decoded: unknown
+    try {
+      decoded = this.codec.decode(message.data)
+    } catch {
+      this.recordAudit({ dir: 'drop', subject: message.subject, reason: 'malformed_json' })
+      return
+    }
+    const result = validateEnvelope(
+      decoded,
+      this.allowedFromClaims,
+      this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES,
+    )
+    if (!result.ok) {
+      this.recordAudit({ dir: 'drop', subject: message.subject, reason: result.error })
+      return
+    }
+
+    const reqId = randomBytes(16).toString('hex')
+    await this.injectIntoSession(result.envelope, reqId).catch(error => {
+      this.recordAudit({ dir: 'drop', subject: message.subject, reason: 'injection_failed', error: String(error) })
+    })
   }
 
   protected onResult(message: Msg): void {
@@ -210,13 +252,13 @@ export class FleetBus {
     this.log(`received ${message.subject}`)
   }
 
-  private subscribe(subject: string, handler: (message: Msg) => void): void {
+  private subscribe(subject: string, handler: (message: Msg) => void | Promise<void>): void {
     if (!this.nc) throw new Error('FleetBus is not connected')
     const subscription = this.nc.subscribe(subject)
     this.subscriptions.add(subscription)
     void (async () => {
       try {
-        for await (const message of subscription) handler(message)
+        for await (const message of subscription) await handler(message)
       } catch (error) {
         if (!this.nc?.isClosed()) this.log(`subscription ${subject} failed: ${String(error)}`)
       } finally {
@@ -242,6 +284,32 @@ export class FleetBus {
       if (status.type === 'disconnect' || status.type === 'reconnect' || status.type === 'error') {
         this.log(`${status.type}: ${String(status.data)}`)
       }
+    }
+  }
+
+  private async injectIntoSession(envelope: Envelope, reqId: string): Promise<void> {
+    if (!this.config.injectIntoSession) {
+      this.log(`received ${envelope.kind} from ${envelope.from}; session injection is not configured`)
+      return
+    }
+    await this.config.injectIntoSession({ envelope, reqId })
+    this.recordAudit({ dir: 'in', envelope, req_id: reqId })
+  }
+
+  private recordAudit(entry: Record<string, unknown>): void {
+    if (!this.config.auditLogPath) {
+      this.log(JSON.stringify(entry))
+      return
+    }
+    try {
+      mkdirSync(dirname(this.config.auditLogPath), { recursive: true, mode: 0o700 })
+      appendFileSync(this.config.auditLogPath, `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`, {
+        encoding: 'utf8',
+        mode: 0o600,
+      })
+      chmodSync(this.config.auditLogPath, 0o600)
+    } catch (error) {
+      this.log(`audit write failed: ${String(error)}`)
     }
   }
 
