@@ -1,4 +1,8 @@
 import { connect as natsConnect, JSONCodec, type NatsConnection, type Msg, type Subscription } from 'nats'
+import { randomBytes, randomUUID } from 'node:crypto'
+import { appendFileSync, chmodSync, mkdirSync, readFileSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { parse as parseYaml } from 'yaml'
 
 export const DEFAULT_MAX_ENVELOPE_BYTES = 1_044_480
 
@@ -6,7 +10,7 @@ export interface Envelope<P = unknown> {
   envelope_version: 1
   id: string
   from: string
-  to?: string
+  to?: string | null
   kind: string
   in_reply_to?: string
   ts: string
@@ -23,6 +27,13 @@ export interface FleetBusConfig {
   heartbeatIntervalMs?: number
   pluginVersion?: string
   logger?: (message: string) => void
+  auditLogPath?: string
+  injectIntoSession?: (event: FleetBusSessionEvent) => Promise<void>
+}
+
+export interface FleetBusSessionEvent {
+  envelope: Envelope
+  reqId: string
 }
 
 export interface TokenBucket {
@@ -82,6 +93,45 @@ export function normalizeAllowlist(values: Iterable<unknown>): Set<string> {
   return result
 }
 
+export function loadFleetManifestAllowlist(path: string): Set<string> {
+  const manifest = parseYaml(readFileSync(path, 'utf8')) as unknown
+  if (typeof manifest !== 'object' || manifest === null || Array.isArray(manifest)) {
+    throw new TypeError('Fleet manifest must be a YAML mapping')
+  }
+  const botNames = (manifest as Record<string, unknown>).bot_names
+  if (!Array.isArray(botNames) || botNames.length === 0) {
+    throw new TypeError('Fleet manifest bot_names must be a non-empty list')
+  }
+  return normalizeAllowlist(botNames)
+}
+
+export function createHeartbeatEnvelope(
+  botName: string,
+  pluginVersion: string,
+  pid = process.pid,
+  now = new Date(),
+): Envelope {
+  const from = normalizeBotName(botName)
+  if (from === null) throw new TypeError('Invalid heartbeat bot name')
+  const ts = now.toISOString()
+  return {
+    envelope_version: 1,
+    id: randomUUID(),
+    from,
+    to: null,
+    kind: 'status_heartbeat',
+    ts,
+    payload: {
+      online: true,
+      process_alive_ts: ts,
+      session_last_response_ts: null,
+      injection_delivered_ts: null,
+      pid,
+      plugin_version: pluginVersion,
+    },
+  }
+}
+
 /** Validate the v1 wire envelope before it reaches any bus handler. */
 export function validateEnvelope(
   value: unknown,
@@ -98,7 +148,9 @@ export function validateEnvelope(
   if (typeof candidate.kind !== 'string' || candidate.kind.length === 0) return { ok: false, error: 'invalid_kind' }
   if (typeof candidate.ts !== 'string' || Number.isNaN(Date.parse(candidate.ts))) return { ok: false, error: 'invalid_ts' }
   if (!Object.hasOwn(candidate, 'payload')) return { ok: false, error: 'missing_payload' }
-  if (candidate.to !== undefined && typeof candidate.to !== 'string') return { ok: false, error: 'invalid_to' }
+  if (candidate.to !== undefined && candidate.to !== null && typeof candidate.to !== 'string') {
+    return { ok: false, error: 'invalid_to' }
+  }
   if (candidate.in_reply_to !== undefined && typeof candidate.in_reply_to !== 'string') {
     return { ok: false, error: 'invalid_in_reply_to' }
   }
@@ -192,9 +244,37 @@ export class FleetBus {
     throw new Error('FleetBus.publishReply is not implemented')
   }
 
-  protected onRequest(message: Msg): void {
-    this.log(`received ${message.subject}`)
-    // TODO(stage-2): validate, gate, ledger, audit, then inject into the session.
+  protected async onRequest(message: Msg): Promise<void> {
+    let decoded: unknown
+    try {
+      decoded = this.codec.decode(message.data)
+    } catch {
+      this.recordAudit({ dir: 'drop', subject: message.subject, reason: 'malformed_json' })
+      return
+    }
+    const result = validateEnvelope(
+      decoded,
+      this.allowedFromClaims,
+      this.config.maxEnvelopeBytes ?? DEFAULT_MAX_ENVELOPE_BYTES,
+    )
+    if (!result.ok) {
+      this.recordAudit({ dir: 'drop', subject: message.subject, reason: result.error })
+      return
+    }
+    if (normalizeBotName(result.envelope.to) !== normalizeBotName(this.config.botName)) {
+      this.recordAudit({
+        dir: 'drop',
+        subject: message.subject,
+        reason: 'recipient_mismatch',
+        envelope_id: result.envelope.id,
+      })
+      return
+    }
+
+    const reqId = randomBytes(16).toString('hex')
+    await this.injectIntoSession(result.envelope, reqId).catch(error => {
+      this.recordAudit({ dir: 'drop', subject: message.subject, reason: 'injection_failed', error: String(error) })
+    })
   }
 
   protected onResult(message: Msg): void {
@@ -210,13 +290,13 @@ export class FleetBus {
     this.log(`received ${message.subject}`)
   }
 
-  private subscribe(subject: string, handler: (message: Msg) => void): void {
+  private subscribe(subject: string, handler: (message: Msg) => void | Promise<void>): void {
     if (!this.nc) throw new Error('FleetBus is not connected')
     const subscription = this.nc.subscribe(subject)
     this.subscriptions.add(subscription)
     void (async () => {
       try {
-        for await (const message of subscription) handler(message)
+        for await (const message of subscription) await handler(message)
       } catch (error) {
         if (!this.nc?.isClosed()) this.log(`subscription ${subject} failed: ${String(error)}`)
       } finally {
@@ -227,14 +307,13 @@ export class FleetBus {
 
   private publishHeartbeat(): void {
     if (!this.nc || this.nc.isClosed()) return
-    this.nc.publish(`fleet.${this.config.botName}.status`, this.codec.encode({
-      online: true,
-      process_alive_ts: new Date().toISOString(),
-      session_last_response_ts: null,
-      injection_delivered_ts: null,
-      pid: process.pid,
-      plugin_version: this.config.pluginVersion ?? '0.3.0',
-    }))
+    this.nc.publish(
+      `fleet.${this.config.botName}.status`,
+      this.codec.encode(createHeartbeatEnvelope(
+        this.config.botName,
+        this.config.pluginVersion ?? '0.4.0',
+      )),
+    )
   }
 
   private async watchConnectionStatus(nc: NatsConnection): Promise<void> {
@@ -242,6 +321,32 @@ export class FleetBus {
       if (status.type === 'disconnect' || status.type === 'reconnect' || status.type === 'error') {
         this.log(`${status.type}: ${String(status.data)}`)
       }
+    }
+  }
+
+  private async injectIntoSession(envelope: Envelope, reqId: string): Promise<void> {
+    if (!this.config.injectIntoSession) {
+      this.log(`received ${envelope.kind} from ${envelope.from}; session injection is not configured`)
+      return
+    }
+    await this.config.injectIntoSession({ envelope, reqId })
+    this.recordAudit({ dir: 'in', envelope, req_id: reqId })
+  }
+
+  private recordAudit(entry: Record<string, unknown>): void {
+    if (!this.config.auditLogPath) {
+      this.log(JSON.stringify(entry))
+      return
+    }
+    try {
+      mkdirSync(dirname(this.config.auditLogPath), { recursive: true, mode: 0o700 })
+      appendFileSync(this.config.auditLogPath, `${JSON.stringify({ ts: new Date().toISOString(), ...entry })}\n`, {
+        encoding: 'utf8',
+        mode: 0o600,
+      })
+      chmodSync(this.config.auditLogPath, 0o600)
+    } catch (error) {
+      this.log(`audit write failed: ${String(error)}`)
     }
   }
 
