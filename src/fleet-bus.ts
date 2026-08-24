@@ -1,0 +1,251 @@
+import { connect as natsConnect, JSONCodec, type NatsConnection, type Msg, type Subscription } from 'nats'
+
+export const DEFAULT_MAX_ENVELOPE_BYTES = 1_044_480
+
+export interface Envelope<P = unknown> {
+  envelope_version: 1
+  id: string
+  from: string
+  to?: string
+  kind: string
+  in_reply_to?: string
+  ts: string
+  payload: P
+}
+
+export interface FleetBusConfig {
+  botName: string
+  url: string
+  user: string
+  password: string
+  subscribeBroadcast?: boolean
+  maxEnvelopeBytes?: number
+  heartbeatIntervalMs?: number
+  pluginVersion?: string
+  logger?: (message: string) => void
+}
+
+export interface TokenBucket {
+  allow(key: string): boolean
+}
+
+export interface FleetBusRateLimiters {
+  perFrom: TokenBucket
+  perSubject: TokenBucket
+  perSessionInject: TokenBucket
+}
+
+export interface FleetBusRequestOptions {
+  to: string
+  kind: string
+  payload: unknown
+  wait?: boolean
+  timeoutMs?: number
+  force?: boolean
+}
+
+export interface FleetBusRequestResult {
+  ok: boolean
+  envelope?: Envelope
+  delivered_to_subscriber?: boolean
+  error?: string
+}
+
+export interface FleetBusReplyResult {
+  ok: boolean
+  envelope?: Envelope
+  error?: 'req_id_unknown' | string
+  req_id?: string
+}
+
+export type EnvelopeValidationResult =
+  | { ok: true; envelope: Envelope }
+  | { ok: false; error: string }
+
+const BOT_NAME_PATTERN = /^[a-z0-9_-]+$/
+
+/** Return the canonical bus identity, or null for a non-ASCII/invalid claim. */
+export function normalizeBotName(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const normalized = value.normalize('NFKC').toLowerCase()
+  return BOT_NAME_PATTERN.test(normalized) ? normalized : null
+}
+
+/** Normalize a manifest bot_names list, rejecting invalid entries. */
+export function normalizeAllowlist(values: Iterable<unknown>): Set<string> {
+  const result = new Set<string>()
+  for (const value of values) {
+    const normalized = normalizeBotName(value)
+    if (normalized === null) throw new TypeError(`Invalid fleet bot name: ${String(value)}`)
+    result.add(normalized)
+  }
+  return result
+}
+
+/** Validate the v1 wire envelope before it reaches any bus handler. */
+export function validateEnvelope(
+  value: unknown,
+  allowedFromClaims: ReadonlySet<string>,
+  maxBytes = DEFAULT_MAX_ENVELOPE_BYTES,
+): EnvelopeValidationResult {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { ok: false, error: 'envelope_not_object' }
+  }
+
+  const candidate = value as Record<string, unknown>
+  if (candidate.envelope_version !== 1) return { ok: false, error: 'unsupported_envelope_version' }
+  if (typeof candidate.id !== 'string' || candidate.id.length === 0) return { ok: false, error: 'invalid_id' }
+  if (typeof candidate.kind !== 'string' || candidate.kind.length === 0) return { ok: false, error: 'invalid_kind' }
+  if (typeof candidate.ts !== 'string' || Number.isNaN(Date.parse(candidate.ts))) return { ok: false, error: 'invalid_ts' }
+  if (!Object.hasOwn(candidate, 'payload')) return { ok: false, error: 'missing_payload' }
+  if (candidate.to !== undefined && typeof candidate.to !== 'string') return { ok: false, error: 'invalid_to' }
+  if (candidate.in_reply_to !== undefined && typeof candidate.in_reply_to !== 'string') {
+    return { ok: false, error: 'invalid_in_reply_to' }
+  }
+
+  const from = normalizeBotName(candidate.from)
+  if (from === null || !allowedFromClaims.has(from)) return { ok: false, error: 'from_claim_rejected' }
+
+  let encodedBytes: number
+  try {
+    encodedBytes = Buffer.byteLength(JSON.stringify(candidate), 'utf8')
+  } catch {
+    return { ok: false, error: 'payload_not_serializable' }
+  }
+  if (encodedBytes > maxBytes) return { ok: false, error: 'envelope_too_large' }
+
+  return { ok: true, envelope: { ...candidate, from } as unknown as Envelope }
+}
+
+/**
+ * Session-owned NATS transport. Stage 1 defines its contract only; transport,
+ * subscriptions, heartbeat, injection, ledgers, and rate limiting land in the
+ * subsequent implementation commits described by the v0.6 spec.
+ */
+export class FleetBus {
+  private nc?: NatsConnection
+  private readonly subscriptions = new Set<Subscription>()
+  private heartbeatTimer?: ReturnType<typeof setInterval>
+  private readonly codec = JSONCodec<unknown>()
+
+  constructor(
+    private readonly config: FleetBusConfig,
+    private readonly allowedFromClaims: ReadonlySet<string>,
+  ) {}
+
+  async connect(): Promise<void> {
+    if (this.nc) return
+
+    const botName = normalizeBotName(this.config.botName)
+    const user = normalizeBotName(this.config.user)
+    if (botName === null || user === null || botName !== user) {
+      throw new Error('FleetBus botName and user must be the same canonical fleet identity')
+    }
+
+    const nc = await natsConnect({
+      servers: this.config.url,
+      user,
+      pass: this.config.password,
+      inboxPrefix: `_INBOX_${botName}`,
+    })
+
+    try {
+      this.nc = nc
+      this.subscribe(`fleet.${botName}.request`, message => this.onRequest(message))
+      this.subscribe(`fleet.${botName}.result`, message => this.onResult(message))
+      this.subscribe(`fleet.${botName}.status`, message => this.onStatus(message))
+      if (this.config.subscribeBroadcast) {
+        this.subscribe('fleet.broadcast.>', message => this.onBroadcast(message))
+      }
+      this.publishHeartbeat()
+      this.heartbeatTimer = setInterval(
+        () => this.publishHeartbeat(),
+        this.config.heartbeatIntervalMs ?? 30_000,
+      )
+      this.log(`connected as ${botName}`)
+      void this.watchConnectionStatus(nc)
+    } catch (error) {
+      this.nc = undefined
+      await nc.close()
+      throw error
+    }
+  }
+
+  async disconnect(): Promise<void> {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+    this.heartbeatTimer = undefined
+    for (const subscription of this.subscriptions) subscription.unsubscribe()
+    this.subscriptions.clear()
+
+    const nc = this.nc
+    this.nc = undefined
+    if (nc && !nc.isClosed()) await nc.drain()
+  }
+
+  async request(_options: FleetBusRequestOptions): Promise<FleetBusRequestResult> {
+    // TODO(stage-3): publish request and optionally await the ephemeral inbox.
+    throw new Error('FleetBus.request is not implemented')
+  }
+
+  publishReply(_reqId: string, _payload: unknown, _kind = 'result'): FleetBusReplyResult {
+    // TODO(stage-3): resolve the server-side inflight ledger and publish reply.
+    throw new Error('FleetBus.publishReply is not implemented')
+  }
+
+  protected onRequest(message: Msg): void {
+    this.log(`received ${message.subject}`)
+    // TODO(stage-2): validate, gate, ledger, audit, then inject into the session.
+  }
+
+  protected onResult(message: Msg): void {
+    this.log(`received ${message.subject}`)
+    // TODO(stage-3): validate, gate, dedupe, and resolve waiter or inject result.
+  }
+
+  protected onStatus(message: Msg): void {
+    this.log(`received ${message.subject}`)
+  }
+
+  protected onBroadcast(message: Msg): void {
+    this.log(`received ${message.subject}`)
+  }
+
+  private subscribe(subject: string, handler: (message: Msg) => void): void {
+    if (!this.nc) throw new Error('FleetBus is not connected')
+    const subscription = this.nc.subscribe(subject)
+    this.subscriptions.add(subscription)
+    void (async () => {
+      try {
+        for await (const message of subscription) handler(message)
+      } catch (error) {
+        if (!this.nc?.isClosed()) this.log(`subscription ${subject} failed: ${String(error)}`)
+      } finally {
+        this.subscriptions.delete(subscription)
+      }
+    })()
+  }
+
+  private publishHeartbeat(): void {
+    if (!this.nc || this.nc.isClosed()) return
+    this.nc.publish(`fleet.${this.config.botName}.status`, this.codec.encode({
+      online: true,
+      process_alive_ts: new Date().toISOString(),
+      session_last_response_ts: null,
+      injection_delivered_ts: null,
+      pid: process.pid,
+      plugin_version: this.config.pluginVersion ?? '0.3.0',
+    }))
+  }
+
+  private async watchConnectionStatus(nc: NatsConnection): Promise<void> {
+    for await (const status of nc.status()) {
+      if (status.type === 'disconnect' || status.type === 'reconnect' || status.type === 'error') {
+        this.log(`${status.type}: ${String(status.data)}`)
+      }
+    }
+  }
+
+  private log(message: string): void {
+    this.config.logger?.(`FleetBus: ${message}`)
+  }
+}

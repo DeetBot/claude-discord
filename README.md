@@ -118,6 +118,24 @@ Quick reference: IDs are Discord **snowflakes** (numeric — enable Developer Mo
 Inbound messages trigger a typing indicator automatically — Discord shows
 "botname is typing…" while the assistant works on a response.
 
+## Fleet bus (experimental)
+
+NATS fleet-bus support is disabled by default. Set `FLEET_BUS_DISABLED=0` to
+enable it for a session. A connection failure is logged to stderr and leaves
+the existing Discord path running unchanged.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `FLEET_BUS_DISABLED` | disabled unless exactly `0` | Feature gate |
+| `FLEET_BUS_URL` | `nats://127.0.0.1:4222` | NATS server URL; bots attached to the shared `fleet-bus-net` Docker network use `nats://nats:4222` |
+| `FLEET_BUS_USER` | persona `name` | Per-bot NATS username and subject identity |
+| `FLEET_BUS_TOKEN_FILE` | `~/.claude/fleet-bus-token-<bot>` | File containing the per-bot NATS password |
+| `FLEET_BUS_SUBSCRIBE_BROADCAST` | `0` | Subscribe to `fleet.broadcast.>` when set to `1` |
+
+The module subscribes to the bot's request, result, and status subjects and
+publishes a process heartbeat every 30 seconds. Stage 1 logs received bus
+messages only; it does not inject them into the model session.
+
 ## Voice mode
 
 Voice mode lets the configured user speak in a Discord voice channel and have the assistant hear (STT) and optionally speak back (TTS).

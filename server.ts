@@ -36,6 +36,8 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, 
 import { homedir } from 'os'
 import { join, sep } from 'path'
 import { VoiceManager, requiredVoiceUserId, voiceUserName } from './voice'
+import { FleetBus, normalizeAllowlist, normalizeBotName } from './src/fleet-bus'
+import packageJson from './package.json' with { type: 'json' }
 
 const VOICE_TRANSCRIPT_USER_NAME = 'User'
 const SLASH_COMMAND_VOICE_USER_NAME = 'the configured user'
@@ -784,8 +786,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 await mcp.connect(new StdioServerTransport())
 
-// When Claude Code closes the MCP connection, stdin gets EOF. Without this
-// the gateway stays connected as a zombie holding resources.
+let fleetBus: FleetBus | undefined
+
+// Register teardown before any optional network await. stdin EOF is not
+// replayed, so registering after a slow NATS connect can leave a zombie.
 let shuttingDown = false
 function shutdown(): void {
   if (shuttingDown) return
@@ -793,12 +797,50 @@ function shutdown(): void {
   process.stderr.write('artifice-discord: shutting down\n')
   voiceManager.shutdown()
   setTimeout(() => process.exit(0), 2000)
-  void Promise.resolve(client.destroy()).finally(() => process.exit(0))
+  void Promise.allSettled([
+    Promise.resolve(client.destroy()),
+    fleetBus?.disconnect() ?? Promise.resolve(),
+  ]).finally(() => process.exit(0))
 }
 process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
 process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
+
+if (process.env.FLEET_BUS_DISABLED === '0') {
+  const botName = normalizeBotName(process.env.FLEET_BUS_USER ?? readPersonaName())
+  if (!botName) {
+    process.stderr.write('artifice-discord: FleetBus disabled: FLEET_BUS_USER or persona name is invalid\n')
+  } else {
+    const tokenPath = process.env.FLEET_BUS_TOKEN_FILE ?? join(homedir(), '.claude', `fleet-bus-token-${botName}`)
+    // FleetBus is optional: never hold Discord startup behind a network await.
+    void (async () => {
+      try {
+        const password = readFileSync(tokenPath, 'utf8').trim()
+        if (!password) throw new Error('token file is empty')
+        const candidate = new FleetBus({
+          botName,
+          user: botName,
+          password,
+          url: process.env.FLEET_BUS_URL ?? 'nats://127.0.0.1:4222',
+          subscribeBroadcast: process.env.FLEET_BUS_SUBSCRIBE_BROADCAST === '1',
+          pluginVersion: packageJson.version,
+          logger: message => process.stderr.write(`artifice-discord: ${message}\n`),
+        }, normalizeAllowlist([botName]))
+        await candidate.connect()
+        if (shuttingDown) {
+          await candidate.disconnect()
+          return
+        }
+        fleetBus = candidate
+      } catch (error) {
+        if (!shuttingDown) {
+          process.stderr.write(`artifice-discord: FleetBus unavailable; Discord-only mode: ${String(error)}\n`)
+        }
+      }
+    })()
+  }
+}
 
 client.on('error', err => {
   process.stderr.write(`artifice-discord: client error: ${err}\n`)
