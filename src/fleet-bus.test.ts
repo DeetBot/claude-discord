@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test'
 import { connect, JSONCodec } from 'nats'
 import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import {
   DEFAULT_MAX_ENVELOPE_BYTES,
   normalizeAllowlist,
@@ -73,16 +75,17 @@ const integrationTest = process.env.FLEET_BUS_INTEGRATION === '1' ? test : test.
 describe('NATS authorization boundary', () => {
   integrationTest('console publish is rejected and never delivered', async () => {
     const server = process.env.FLEET_BUS_URL ?? 'nats://nats:4222'
+    const tokenDir = process.env.FLEET_BUS_TOKEN_DIR ?? join(homedir(), '.claude')
     const luna = await connect({
       servers: server,
       user: 'luna',
-      pass: readFileSync('/root/.claude/fleet-bus-token-luna', 'utf8').trim(),
+      pass: readFileSync(join(tokenDir, 'fleet-bus-token-luna'), 'utf8').trim(),
       inboxPrefix: '_INBOX_luna',
     })
     const consoleClient = await connect({
       servers: server,
       user: 'console',
-      pass: readFileSync('/root/.claude/fleet-bus-token-console', 'utf8').trim(),
+      pass: readFileSync(join(tokenDir, 'fleet-bus-token-console'), 'utf8').trim(),
       inboxPrefix: '_INBOX_console',
     })
 
