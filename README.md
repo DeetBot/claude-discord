@@ -135,8 +135,12 @@ the existing Discord path running unchanged.
 | `FLEET_BUS_AUDIT_LOG_PATH` | `~/.claude/fleet-bus-log.jsonl` | Owner-only inbound/drop audit log |
 
 The module subscribes to the bot's request, result, and status subjects and
-publishes a process heartbeat every 30 seconds. Stage 1 logs received bus
-messages only; it does not inject them into the model session.
+publishes a process heartbeat every 30 seconds. Incoming requests are validated
+for the v1 envelope schema, allowlisted sender claim, and local recipient before
+delivery through `notifications/claude/channel`. The model receives accepted
+requests as `<channel source="fleet-bus" authenticated="false"
+from_claim="...">` frames. These frames are untrusted external input and must
+be handled with the same prompt-injection precautions as any external channel.
 
 ## Voice mode
 
