@@ -1,4 +1,6 @@
 import { describe, expect, test } from 'bun:test'
+import { connect, JSONCodec } from 'nats'
+import { readFileSync } from 'node:fs'
 import {
   DEFAULT_MAX_ENVELOPE_BYTES,
   normalizeAllowlist,
@@ -63,5 +65,52 @@ describe('envelope validation', () => {
   test('rejects envelopes above the encoded byte limit', () => {
     const value = envelope({ payload: 'x'.repeat(DEFAULT_MAX_ENVELOPE_BYTES) })
     expect(validateEnvelope(value, allowlist)).toEqual({ ok: false, error: 'envelope_too_large' })
+  })
+})
+
+const integrationTest = process.env.FLEET_BUS_INTEGRATION === '1' ? test : test.skip
+
+describe('NATS authorization boundary', () => {
+  integrationTest('console publish is rejected and never delivered', async () => {
+    const server = process.env.FLEET_BUS_URL ?? 'nats://nats:4222'
+    const luna = await connect({
+      servers: server,
+      user: 'luna',
+      pass: readFileSync('/root/.claude/fleet-bus-token-luna', 'utf8').trim(),
+      inboxPrefix: '_INBOX_luna',
+    })
+    const consoleClient = await connect({
+      servers: server,
+      user: 'console',
+      pass: readFileSync('/root/.claude/fleet-bus-token-console', 'utf8').trim(),
+      inboxPrefix: '_INBOX_console',
+    })
+
+    try {
+      let delivered = false
+      const subscription = luna.subscribe('fleet.luna.request', {
+        callback: () => { delivered = true },
+      })
+      await luna.flush()
+
+      const violations: string[] = []
+      void (async () => {
+        for await (const status of consoleClient.status()) {
+          if (status.type === 'error' || status.type === 'permissionError') {
+            violations.push(String(status.data))
+          }
+        }
+      })().catch(() => {})
+
+      consoleClient.publish('fleet.luna.request', JSONCodec().encode(envelope({ from: 'console' })))
+      await consoleClient.flush()
+      await new Promise(resolve => setTimeout(resolve, 500))
+
+      expect(violations.some(value => /permissions?[_ ]violation/i.test(value))).toBe(true)
+      expect(delivered).toBe(false)
+      subscription.unsubscribe()
+    } finally {
+      await Promise.all([consoleClient.close(), luna.close()])
+    }
   })
 })
