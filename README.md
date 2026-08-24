@@ -127,7 +127,7 @@ the existing Discord path running unchanged.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `FLEET_BUS_DISABLED` | disabled unless exactly `0` | Feature gate |
-| `FLEET_BUS_URL` | `nats://127.0.0.1:4222` | NATS server URL; container bots use `nats://172.17.0.1:4222` |
+| `FLEET_BUS_URL` | `nats://127.0.0.1:4222` | NATS server URL; bots attached to the shared `fleet-bus-net` Docker network use `nats://nats:4222` |
 | `FLEET_BUS_USER` | persona `name` | Per-bot NATS username and subject identity |
 | `FLEET_BUS_TOKEN_FILE` | `~/.claude/fleet-bus-token-<bot>` | File containing the per-bot NATS password |
 | `FLEET_BUS_SUBSCRIBE_BROADCAST` | `0` | Subscribe to `fleet.broadcast.>` when set to `1` |
