@@ -1,4 +1,4 @@
-import type { NatsConnection, Msg, Subscription } from 'nats'
+import { connect as natsConnect, JSONCodec, type NatsConnection, type Msg, type Subscription } from 'nats'
 
 export const DEFAULT_MAX_ENVELOPE_BYTES = 1_044_480
 
@@ -20,6 +20,19 @@ export interface FleetBusConfig {
   password: string
   subscribeBroadcast?: boolean
   maxEnvelopeBytes?: number
+  heartbeatIntervalMs?: number
+  pluginVersion?: string
+  logger?: (message: string) => void
+}
+
+export interface TokenBucket {
+  allow(key: string): boolean
+}
+
+export interface FleetBusRateLimiters {
+  perFrom: TokenBucket
+  perSubject: TokenBucket
+  perSessionInject: TokenBucket
 }
 
 export interface FleetBusRequestOptions {
@@ -112,6 +125,8 @@ export function validateEnvelope(
 export class FleetBus {
   private nc?: NatsConnection
   private readonly subscriptions = new Set<Subscription>()
+  private heartbeatTimer?: ReturnType<typeof setInterval>
+  private readonly codec = JSONCodec<unknown>()
 
   constructor(
     private readonly config: FleetBusConfig,
@@ -119,13 +134,52 @@ export class FleetBus {
   ) {}
 
   async connect(): Promise<void> {
-    // TODO(stage-1): connect with per-bot user/password and scoped inbox prefix.
-    throw new Error('FleetBus.connect is not implemented')
+    if (this.nc) return
+
+    const botName = normalizeBotName(this.config.botName)
+    const user = normalizeBotName(this.config.user)
+    if (botName === null || user === null || botName !== user) {
+      throw new Error('FleetBus botName and user must be the same canonical fleet identity')
+    }
+
+    const nc = await natsConnect({
+      servers: this.config.url,
+      user,
+      pass: this.config.password,
+      inboxPrefix: `_INBOX_${botName}`,
+    })
+
+    try {
+      this.nc = nc
+      this.subscribe(`fleet.${botName}.request`, message => this.onRequest(message))
+      this.subscribe(`fleet.${botName}.result`, message => this.onResult(message))
+      this.subscribe(`fleet.${botName}.status`, message => this.onStatus(message))
+      if (this.config.subscribeBroadcast) {
+        this.subscribe('fleet.broadcast.>', message => this.onBroadcast(message))
+      }
+      this.publishHeartbeat()
+      this.heartbeatTimer = setInterval(
+        () => this.publishHeartbeat(),
+        this.config.heartbeatIntervalMs ?? 30_000,
+      )
+      this.log(`connected as ${botName}`)
+      void this.watchConnectionStatus(nc)
+    } catch (error) {
+      this.nc = undefined
+      await nc.close()
+      throw error
+    }
   }
 
   async disconnect(): Promise<void> {
-    // TODO(stage-1): stop heartbeat/subscriptions and drain the NATS connection.
-    throw new Error('FleetBus.disconnect is not implemented')
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+    this.heartbeatTimer = undefined
+    for (const subscription of this.subscriptions) subscription.unsubscribe()
+    this.subscriptions.clear()
+
+    const nc = this.nc
+    this.nc = undefined
+    if (nc && !nc.isClosed()) await nc.drain()
   }
 
   async request(_options: FleetBusRequestOptions): Promise<FleetBusRequestResult> {
@@ -138,11 +192,60 @@ export class FleetBus {
     throw new Error('FleetBus.publishReply is not implemented')
   }
 
-  protected onRequest(_message: Msg): void {
+  protected onRequest(message: Msg): void {
+    this.log(`received ${message.subject}`)
     // TODO(stage-2): validate, gate, ledger, audit, then inject into the session.
   }
 
-  protected onResult(_message: Msg): void {
+  protected onResult(message: Msg): void {
+    this.log(`received ${message.subject}`)
     // TODO(stage-3): validate, gate, dedupe, and resolve waiter or inject result.
+  }
+
+  protected onStatus(message: Msg): void {
+    this.log(`received ${message.subject}`)
+  }
+
+  protected onBroadcast(message: Msg): void {
+    this.log(`received ${message.subject}`)
+  }
+
+  private subscribe(subject: string, handler: (message: Msg) => void): void {
+    if (!this.nc) throw new Error('FleetBus is not connected')
+    const subscription = this.nc.subscribe(subject)
+    this.subscriptions.add(subscription)
+    void (async () => {
+      try {
+        for await (const message of subscription) handler(message)
+      } catch (error) {
+        if (!this.nc?.isClosed()) this.log(`subscription ${subject} failed: ${String(error)}`)
+      } finally {
+        this.subscriptions.delete(subscription)
+      }
+    })()
+  }
+
+  private publishHeartbeat(): void {
+    if (!this.nc || this.nc.isClosed()) return
+    this.nc.publish(`fleet.${this.config.botName}.status`, this.codec.encode({
+      online: true,
+      process_alive_ts: new Date().toISOString(),
+      session_last_response_ts: null,
+      injection_delivered_ts: null,
+      pid: process.pid,
+      plugin_version: this.config.pluginVersion ?? '0.3.0',
+    }))
+  }
+
+  private async watchConnectionStatus(nc: NatsConnection): Promise<void> {
+    for await (const status of nc.status()) {
+      if (status.type === 'disconnect' || status.type === 'reconnect' || status.type === 'error') {
+        this.log(`${status.type}: ${String(status.data)}`)
+      }
+    }
+  }
+
+  private log(message: string): void {
+    this.config.logger?.(`FleetBus: ${message}`)
   }
 }
