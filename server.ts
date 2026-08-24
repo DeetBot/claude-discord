@@ -813,23 +813,32 @@ if (process.env.FLEET_BUS_DISABLED === '0') {
     process.stderr.write('artifice-discord: FleetBus disabled: FLEET_BUS_USER or persona name is invalid\n')
   } else {
     const tokenPath = process.env.FLEET_BUS_TOKEN_FILE ?? join(homedir(), '.claude', `fleet-bus-token-${botName}`)
-    try {
-      const password = readFileSync(tokenPath, 'utf8').trim()
-      if (!password) throw new Error('token file is empty')
-      fleetBus = new FleetBus({
-        botName,
-        user: botName,
-        password,
-        url: process.env.FLEET_BUS_URL ?? 'nats://127.0.0.1:4222',
-        subscribeBroadcast: process.env.FLEET_BUS_SUBSCRIBE_BROADCAST === '1',
-        pluginVersion: packageJson.version,
-        logger: message => process.stderr.write(`artifice-discord: ${message}\n`),
-      }, normalizeAllowlist([botName]))
-      await fleetBus.connect()
-    } catch (error) {
-      fleetBus = undefined
-      process.stderr.write(`artifice-discord: FleetBus unavailable; Discord-only mode: ${String(error)}\n`)
-    }
+    // FleetBus is optional: never hold Discord startup behind a network await.
+    void (async () => {
+      try {
+        const password = readFileSync(tokenPath, 'utf8').trim()
+        if (!password) throw new Error('token file is empty')
+        const candidate = new FleetBus({
+          botName,
+          user: botName,
+          password,
+          url: process.env.FLEET_BUS_URL ?? 'nats://127.0.0.1:4222',
+          subscribeBroadcast: process.env.FLEET_BUS_SUBSCRIBE_BROADCAST === '1',
+          pluginVersion: packageJson.version,
+          logger: message => process.stderr.write(`artifice-discord: ${message}\n`),
+        }, normalizeAllowlist([botName]))
+        await candidate.connect()
+        if (shuttingDown) {
+          await candidate.disconnect()
+          return
+        }
+        fleetBus = candidate
+      } catch (error) {
+        if (!shuttingDown) {
+          process.stderr.write(`artifice-discord: FleetBus unavailable; Discord-only mode: ${String(error)}\n`)
+        }
+      }
+    })()
   }
 }
 
